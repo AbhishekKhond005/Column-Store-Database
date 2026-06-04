@@ -327,7 +327,6 @@ public class BitmapIndexManager {
                     resultBits.or(exactMatch);
             }
             case "!=" -> {
-                // All live rows minus the matching ones
                 for (int i = 0; i < totalRows; i++)
                     resultBits.set(i);
                 BitSet exactMatch = colIndex.get(filterVal);
@@ -335,8 +334,7 @@ public class BitmapIndexManager {
                     resultBits.andNot(exactMatch);
             }
             default -> {
-                // Range operators on categorical (string) columns are not meaningful.
-                // Return an empty BitSet — callers will get 0 results, which is correct.
+                return null;
             }
         }
 
