@@ -17,10 +17,15 @@
 7. [Query Engine — Execution](#7-query-engine--execution)
 8. [WHERE Clause & AND/OR Logic](#8-where-clause--andor-logic)
 9. [Bitmap Indexing](#9-bitmap-indexing)
-10. [CLI Client](#10-cli-client)
-11. [Utility & Testing](#11-utility--testing)
-12. [Sample Demonstrations](#12-sample-demonstrations)
-13. [Likely Viva Questions & Answers](#13-likely-viva-questions--answers)
+10. [JOIN Support (INNER JOIN, LEFT JOIN)](#10-join-support-inner-join-left-join)
+11. [Aggregation & GROUP BY](#11-aggregation--group-by)
+12. [ORDER BY, LIMIT & OFFSET](#12-order-by-limit--offset)
+13. [Enhanced WHERE Operators (IN, BETWEEN, LIKE, NOT, IS NULL)](#13-enhanced-where-operators-in-between-like-not-is-null)
+14. [CLI Client](#14-cli-client)
+15. [Binary Schema Persistence](#15-binary-schema-persistence)
+16. [Utility & Testing](#16-utility--testing)
+17. [Sample Demonstrations](#17-sample-demonstrations)
+18. [Likely Viva Questions & Answers](#18-likely-viva-questions--answers)
 
 ---
 
@@ -819,7 +824,196 @@ or
 
 ---
 
-## 10. CLI Client
+## 10. JOIN Support (INNER JOIN, LEFT JOIN)
+
+### Overview
+
+The system now supports multi-table queries via JOIN operations. Both `INNER JOIN` and `LEFT JOIN` are implemented using a **nested loop join** strategy.
+
+### Supported JOIN Syntax
+
+```sql
+SELECT columns FROM table1 INNER JOIN table2 ON table1.col = table2.col [WHERE ...]
+SELECT columns FROM table1 LEFT JOIN table2 ON table1.col = table2.col [WHERE ...]
+```
+
+### How JOINs Work in a Column-Store
+
+1. **Column extraction**: All required columns from both tables are read from their respective `.bin` files
+2. **Nested loop**: For each row in the left table, the system scans all rows in the right table for matching join keys
+3. **Result assembly**: Matching rows are combined into a single result set
+4. **LEFT JOIN**: When no match is found for a left-table row, it is still included with NULL values for right-table columns
+
+### Example
+
+```sql
+SELECT employees.name, products.pname FROM employees
+INNER JOIN products ON employees.id = products.pid
+```
+
+**Output**:
+```
+employees.name	products.pname
+-----------------------------------------------------------
+Alice	Laptop
+Bob	Mouse
+...
+(7 rows)
+```
+
+### Current Limitations
+
+- Table aliases are not yet supported (use full column names)
+- Only equality-based join conditions (`ON a.col = b.col`)
+- Nested loop join only (no hash join optimization yet)
+
+---
+
+## 11. Aggregation & GROUP BY
+
+### Overview
+
+Aggregation functions compute summary statistics across sets of rows. This is a key feature for analytical workloads where column-stores excel.
+
+### Supported Functions
+
+| Function | Syntax | Description | Example |
+|----------|--------|-------------|---------|
+| `COUNT` | `COUNT(col)` or `COUNT(*)` | Count non-null values | `SELECT COUNT(*) FROM employees` |
+| `SUM` | `SUM(col)` | Sum of numeric values | `SELECT SUM(salary) FROM employees` |
+| `AVG` | `AVG(col)` | Average of numeric values | `SELECT AVG(salary) FROM employees` |
+| `MIN` | `MIN(col)` | Minimum value | `SELECT MIN(salary) FROM employees` |
+| `MAX` | `MAX(col)` | Maximum value | `SELECT MAX(salary) FROM employees` |
+
+### How Aggregation Works
+
+Since this is a column-store, aggregate functions only read the specific column file needed. For example, `AVG(salary)` only reads `salary.bin` — no other column files are touched.
+
+### GROUP BY
+
+Group rows that have the same values in specified columns, then apply aggregate functions per group.
+
+```sql
+SELECT department, AVG(salary) FROM employees GROUP BY department
+```
+
+**Output**:
+```
+department	AVG(salary)
+-------------------------------
+Engineering	88666.67
+HR	55000.0
+Finance	74500.0
+Marketing	66500.0
+(4 groups)
+```
+
+### Execution Flow
+
+1. Filter rows using WHERE clause (if present)
+2. Read the aggregate column and group-by column
+3. Partition rows by group key
+4. Apply aggregate function within each partition
+5. Return one row per group
+
+---
+
+## 12. ORDER BY, LIMIT & OFFSET
+
+### ORDER BY
+
+Sort results by a specified column in ascending (`ASC`) or descending (`DESC`) order.
+
+```sql
+SELECT name, salary FROM employees ORDER BY salary DESC
+```
+
+The system reads the order-by column, performs a numeric sort (falling back to string comparison for non-numeric data), and reorders the result rows accordingly.
+
+### LIMIT and OFFSET
+
+Restrict the number of result rows:
+
+```sql
+SELECT * FROM employees LIMIT 5
+SELECT * FROM employees LIMIT 10 OFFSET 2
+```
+
+- `LIMIT` restricts the maximum number of rows returned
+- `OFFSET` skips a number of rows before returning results
+- ORDER BY is applied before LIMIT/OFFSET
+
+### Combined Example
+
+```sql
+SELECT name, salary FROM employees WHERE department = 'Engineering'
+ORDER BY salary DESC LIMIT 3
+```
+
+---
+
+## 13. Enhanced WHERE Operators (IN, BETWEEN, LIKE, NOT, IS NULL)
+
+The WHERE clause has been extended beyond basic comparison operators to support:
+
+### IN / NOT IN
+
+Check if a value matches any value in a list:
+
+```sql
+SELECT * FROM employees WHERE department IN ('Engineering', 'Finance')
+SELECT * FROM employees WHERE id NOT IN (1, 2, 3)
+```
+
+The system evaluates `IN` by checking the cell value against each value in the list. For indexed columns, it falls back to sequential scan.
+
+### BETWEEN / NOT BETWEEN
+
+Check if a value falls within a range (inclusive):
+
+```sql
+SELECT * FROM employees WHERE salary BETWEEN 50000 AND 80000
+SELECT * FROM employees WHERE id NOT BETWEEN 5 AND 10
+```
+
+Both numeric and string comparisons are supported. For numbers, double comparison is used. For strings, lexicographic comparison.
+
+### LIKE / NOT LIKE
+
+Pattern matching with wildcards:
+- `%` matches any sequence of characters
+- `_` matches any single character
+
+```sql
+SELECT * FROM employees WHERE name LIKE 'A%'
+SELECT * FROM employees WHERE name NOT LIKE '%e'
+```
+
+The `LIKE` pattern is converted to a Java regex for evaluation.
+
+### NOT Operator
+
+Negate any condition by prefixing with `NOT`:
+
+```sql
+SELECT * FROM employees WHERE NOT (department = 'HR')
+SELECT * FROM employees WHERE NOT (salary > 50000 AND department = 'Engineering')
+```
+
+The `NOT` flag on a `WhereCondition` inverts the result of the condition evaluation.
+
+### IS NULL / IS NOT NULL
+
+Check for null or empty values:
+
+```sql
+SELECT * FROM employees WHERE name IS NULL
+SELECT * FROM employees WHERE salary IS NOT NULL
+```
+
+---
+
+## 14. CLI Client
 
 The `CLIClient` is the user-facing component. It provides a REPL (Read-Eval-Print-Loop):
 
@@ -862,7 +1056,36 @@ id    name    dept           salary
 
 ---
 
-## 11. Utility & Testing
+## 15. Binary Schema Persistence
+
+### Overview
+
+Schema metadata is now stored in two formats for redundancy and faster startup:
+
+1. **Text schema** (`.schema`): Human-readable format for debugging and manual inspection
+2. **Binary schema** (`.schema.bin`): Structured binary format for faster parsing
+
+### Binary Schema Format
+
+```
+Table name (UTF string)
+Column count (4-byte int)
+  For each column:
+    Column name (UTF string)
+    Column type (UTF string)
+    Constraint count (4-byte int)
+      For each constraint: constraint text (UTF string)
+```
+
+### Benefits
+
+- **Faster startup**: Binary format avoids string splitting and regex parsing
+- **Self-describing**: The binary header contains all information needed to reconstruct the schema
+- **Consistency**: Both formats are written atomically during CREATE TABLE
+
+---
+
+## 16. Utility & Testing
 
 ### FileUtils.java
 
@@ -894,7 +1117,7 @@ An integration test that exercises the full lifecycle with string data:
 
 ---
 
-## 12. Sample Demonstrations
+## 17. Sample Demonstrations
 
 ### Demo 1: Full CRUD Lifecycle
 
@@ -1126,7 +1349,7 @@ Sneha
 
 ---
 
-## 13. Likely Viva Questions & Answers
+## 18. Likely Viva Questions & Answers
 
 ### Q1: What is the difference between a row-store and a column-store?
 **A**: In a row-store, all columns of one row are stored together. In a column-store, each column is stored in a separate file. Column-stores are better for analytical queries (aggregations, reading specific columns) because they only read the columns needed, reducing I/O.
